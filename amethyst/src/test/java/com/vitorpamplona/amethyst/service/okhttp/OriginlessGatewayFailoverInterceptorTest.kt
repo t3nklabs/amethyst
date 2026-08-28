@@ -27,6 +27,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -99,6 +100,21 @@ class OriginlessGatewayFailoverInterceptorTest {
     }
 
     @Test
+    fun returnsLastFailureAfterEveryNodeMisses() {
+        val interceptor = OriginlessGatewayFailoverInterceptor { listOf(primary, secondary) }
+        val chain =
+            FakeChain(
+                "GET",
+                "$primary/ipfs/$cid",
+                codes = listOf(404, 410),
+            )
+        val response = interceptor.intercept(chain.asChain())
+        assertEquals(410, response.code)
+        assertEquals(2, chain.requests.size)
+        response.close()
+    }
+
+    @Test
     fun retriesNextOriginlessNodeOnConnectionFailure() {
         val interceptor = OriginlessGatewayFailoverInterceptor { listOf(primary, secondary) }
         val chain =
@@ -123,6 +139,9 @@ class OriginlessGatewayFailoverInterceptorTest {
     /**
      * Records every [Request] it is asked to proceed and answers each with the
      * next code from [codes]. [failFirst] throws [IOException] on the first proceed.
+     *
+     * Models OkHttp's RealInterceptorChain rule: [Interceptor.Chain.proceed] throws
+     * if the previous response is still open.
      */
     private class FakeChain(
         private val method: String,
@@ -137,6 +156,7 @@ class OriginlessGatewayFailoverInterceptorTest {
                 .method(method, if (method == "POST") ByteArray(0).toRequestBody(null) else null)
                 .build()
         val requests = mutableListOf<Request>()
+        private var openBody: CloseTrackingBody? = null
 
         fun asChain(): Interceptor.Chain =
             Proxy.newProxyInstance(
@@ -146,23 +166,48 @@ class OriginlessGatewayFailoverInterceptorTest {
                 when (method.name) {
                     "request" -> request
                     "proceed" -> {
+                        val previous = openBody
+                        if (previous != null && !previous.closed) {
+                            throw IllegalStateException(
+                                "cannot make a new request because the previous response is still open: please call response.close()",
+                            )
+                        }
                         val proceeded = args[0] as Request
                         requests.add(proceeded)
                         if (failFirst && requests.size == 1) {
                             throw IOException("unreachable")
                         }
                         val code = codes.getOrElse(requests.size - 1) { codes.last() }
+                        val body = CloseTrackingBody()
+                        openBody = body
                         Response
                             .Builder()
                             .request(proceeded)
                             .protocol(Protocol.HTTP_1_1)
                             .code(code)
                             .message("msg")
-                            .body("".toResponseBody(null))
+                            .body(body)
                             .build()
                     }
                     else -> throw UnsupportedOperationException(method.name)
                 }
             } as Interceptor.Chain
+    }
+
+    private class CloseTrackingBody : ResponseBody() {
+        var closed: Boolean = false
+            private set
+        private val delegate = "".toResponseBody(null)
+
+        override fun contentType() = delegate.contentType()
+
+        override fun contentLength() = delegate.contentLength()
+
+        override fun source() = delegate.source()
+
+        override fun close() {
+            closed = true
+            delegate.close()
+        }
     }
 }
